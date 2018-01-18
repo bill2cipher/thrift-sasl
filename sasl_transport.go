@@ -62,7 +62,9 @@ func (s *TSaslTransport) Open() error {
 	}
 	for !s.client.IsComplete() {
 		status, payload, err := s.receiveSaslMessage()
-		if status != negotiationStatusComplete && status != negotiationStatusOk {
+		if err != nil {
+			return err
+		} else if status != negotiationStatusComplete && status != negotiationStatusOk {
 			return fmt.Errorf("Expected COMPLETE or OK, got %d", status)
 		}
 
@@ -115,13 +117,93 @@ func (s *TSaslTransport) Flush() error {
 	copy(payload, s.buffer.Bytes())
 	s.buffer.Reset()
 
+	dataLength := len(payload)
 	if s.wrap {
 		wrapped, err := s.client.Wrap(payload, 0, len(payload))
 		if err != nil {
 			return err
 		}
+		dataLength = len(wrapped)
+		payload = wrapped
 	}
-	return s.TTransport.Flush()
+
+	if err := s.writeLength(dataLength); err != nil {
+		return err
+	} else if _, err := s.TTransport.Write(payload); err != nil {
+		return err
+	} else if err := s.TTransport.Flush(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *TSaslTransport) Write(data []byte) (int, error) {
+	if !s.IsOpen() {
+		return 0, errors.New("SASL authentication not complete")
+	}
+	return s.buffer.Write(data)
+}
+
+func (s *TSaslTransport) Read(data []byte) (int, error) {
+	if !s.IsOpen() {
+		return 0, errors.New("SASL authentication not complete")
+	}
+
+	readCount, err := s.buffer.Read(data)
+	if err != nil {
+		return 0, err
+	} else if readCount > 0 {
+		return readCount, nil
+	}
+
+	s.buffer.Reset()
+	if err := s.readFrame(); err != nil {
+		return 0, err
+	} else if readCount, err := s.buffer.Read(data); err != nil {
+		return 0, err
+	} else {
+		return readCount, nil
+	}
+}
+
+func (s *TSaslTransport) readFrame() error {
+	frameLength, err := s.readLength()
+	if err != nil {
+		return err
+	} else if frameLength < 0 {
+		return fmt.Errorf("Read a negative frame size (%d)", frameLength)
+	}
+
+	buff := make([]byte, frameLength, frameLength)
+	if err := s.readAll(buff); err != nil {
+		return err
+	}
+	if !s.wrap {
+		s.buffer.Write(buff)
+	}
+
+	if unwrapped, err := s.client.Unwrap(buff, 0, len(buff)); err != nil {
+		return err
+	} else if _, err := s.buffer.Write(unwrapped); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *TSaslTransport) readLength() (int, error) {
+	buf := make([]byte, 4, 4)
+	if err := s.readAll(buf); err != nil {
+		return 0, err
+	} else {
+		return int(binary.BigEndian.Uint32(buf)), nil
+	}
+}
+
+func (s *TSaslTransport) writeLength(length int) error {
+	buf := make([]byte, 4, 4)
+	binary.BigEndian.PutUint32(buf, uint32(length))
+	_, err := s.TTransport.Write(buf)
+	return err
 }
 
 func (s *TSaslTransport) handleStartMessage() error {
