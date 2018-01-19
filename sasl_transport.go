@@ -44,7 +44,13 @@ func NewTSaslTransport(transport thrift.TTransport, client sasl.Client) (thrift.
 // Open the underlying transport if it's not already open and then performs
 // SASL negotiation. If a QOP is negotiated during this SASL handshake, it used
 // for all communication on this transport after this call is complete.
-func (s *TSaslTransport) Open() error {
+func (s *TSaslTransport) Open() (err error) {
+	defer func() {
+		if err != nil && s.TTransport.IsOpen() {
+			s.TTransport.Close()
+		}
+	}()
+
 	if s.client != nil && s.client.IsComplete() {
 		return errors.New("SASL transport already open")
 	}
@@ -60,8 +66,13 @@ func (s *TSaslTransport) Open() error {
 	if err := s.handleStartMessage(); err != nil {
 		return err
 	}
+
+	var (
+		status  byte
+		payload []byte
+	)
 	for !s.client.IsComplete() {
-		status, payload, err := s.receiveSaslMessage()
+		status, payload, err = s.receiveSaslMessage()
 		if err != nil {
 			return err
 		} else if status != negotiationStatusComplete && status != negotiationStatusOk {
@@ -82,6 +93,15 @@ func (s *TSaslTransport) Open() error {
 
 	if !s.client.IsComplete() {
 		return errors.New("unexpected state")
+	}
+
+	if status == 0 || status == negotiationStatusOk {
+		status, payload, err = s.receiveSaslMessage()
+		if err != nil {
+			return err
+		} else if status != negotiationStatusComplete {
+			return fmt.Errorf("Expected SASL COMPLETE, bug got %d", status)
+		}
 	}
 
 	if prop, err := s.client.GetNegotiatedProperty(sasl.SaslPropertyQop); err != nil {
@@ -149,10 +169,8 @@ func (s *TSaslTransport) Read(data []byte) (int, error) {
 		return 0, errors.New("SASL authentication not complete")
 	}
 
-	readCount, err := s.buffer.Read(data)
-	if err != nil {
-		return 0, err
-	} else if readCount > 0 {
+	readCount, _ := s.buffer.Read(data)
+	if readCount > 0 {
 		return readCount, nil
 	}
 
@@ -179,7 +197,8 @@ func (s *TSaslTransport) readFrame() error {
 		return err
 	}
 	if !s.wrap {
-		s.buffer.Write(buff)
+		_, err := s.buffer.Write(buff)
+		return err
 	}
 
 	if unwrapped, err := s.client.Unwrap(buff, 0, len(buff)); err != nil {
